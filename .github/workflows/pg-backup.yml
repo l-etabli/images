@@ -1,0 +1,120 @@
+name: pg-backup
+
+# Tests and builds the image on every change to it; publishes it on a
+# pg-backup/pg<major>-v<semver> tag (pg-backup/README.md). Path filters are not
+# evaluated for tag pushes: a release tag always runs.
+on:
+  pull_request:
+    paths:
+      - pg-backup/**
+      - test-helpers/**
+      - package.json
+      - pnpm-lock.yaml
+      - vitest.config.ts
+      - .github/workflows/pg-backup.yml
+  push:
+    branches: [main]
+    tags: ["pg-backup/*"]
+    paths:
+      - pg-backup/**
+      - test-helpers/**
+      - package.json
+      - pnpm-lock.yaml
+      - vitest.config.ts
+      - .github/workflows/pg-backup.yml
+
+env:
+  IMAGE: ghcr.io/l-etabli/pg-backup
+
+jobs:
+  test:
+    name: Test dump.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm test
+
+      # The script runs under busybox sh in the image (shell=busybox directive).
+      - run: shellcheck pg-backup/dump.sh
+
+  image:
+    name: Build${{ startsWith(github.ref, 'refs/tags/') && ' and publish' || '' }} the image
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      # pg-backup/pg17-v1.0.0 publishes pg17-1.0.0. The major must match the
+      # image's pg_dump, checked after the build.
+      - name: Read the release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#pg-backup/}"
+          if [[ ! "$tag" =~ ^pg([0-9]+)-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::Release tag must read pg-backup/pg<major>-v<semver>, got $GITHUB_REF_NAME."
+            exit 1
+          fi
+          echo "PG_MAJOR=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=pg${BASH_REMATCH[1]}-${BASH_REMATCH[2]}" >> "$GITHUB_ENV"
+
+      # The source label links the package to this repository.
+      - name: Build
+        run: |
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --label "org.opencontainers.image.description=pg_dump encrypted with age, uploaded to S3 with rclone, monitored by Sentry Crons" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            --tag pg-backup:ci pg-backup
+
+      - name: Check the tools
+        run: |
+          docker run --rm pg-backup:ci sh -euc '
+            pg_dump --version
+            age --version
+            rclone version | head -1
+            sentry-cli --version
+            command -v dump.sh
+          '
+
+      - name: Check the PostgreSQL major
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(docker run --rm pg-backup:ci pg_dump --version)
+          case "$version" in
+            "pg_dump (PostgreSQL) $PG_MAJOR."*) ;;
+            *) echo "::error::Tag says PostgreSQL $PG_MAJOR, the image has: $version." && exit 1 ;;
+          esac
+
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/')
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Consumers pin readable tags: a published one never changes.
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          if docker manifest inspect "$IMAGE:$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "::error::$IMAGE:$IMAGE_TAG is already published; release a new version."
+            exit 1
+          fi
+          docker tag pg-backup:ci "$IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE:$IMAGE_TAG"
+          echo "Published $IMAGE:$IMAGE_TAG" >> "$GITHUB_STEP_SUMMARY"
