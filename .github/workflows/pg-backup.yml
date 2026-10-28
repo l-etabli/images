@@ -48,8 +48,10 @@ jobs:
 
       - run: pnpm test
 
-      # The script runs under busybox sh in the image (shell=busybox directive).
-      - run: shellcheck pg-backup/dump.sh
+      # The script runs under busybox sh in the image: its shell=busybox
+      # directive needs ShellCheck 0.10+, newer than the runner's.
+      - name: Shellcheck
+        run: docker run --rm -v "$PWD/pg-backup:/mnt:ro" koalaman/shellcheck:v0.11.0 dump.sh
 
   image:
     name: Build${{ startsWith(github.ref, 'refs/tags/') && ' and publish' || '' }} the image
